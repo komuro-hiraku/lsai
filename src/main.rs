@@ -1,8 +1,12 @@
+use anyhow::Ok;
 use clap::{Parser, ValueEnum};
+use reqwest::header;
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
+    fmt::format,
     fs, io,
+    os::linux::raw::stat,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -113,7 +117,7 @@ fn collect_dir(path: &Path) -> io::Result<Vec<FileInfo>> {
         });
     }
 
-    Ok(results)
+    io::Result::Ok(results)
 }
 
 fn build_summary(path: &Path, files: &[FileInfo]) -> DirSummary {
@@ -231,30 +235,98 @@ fn build_summary(path: &Path, files: &[FileInfo]) -> DirSummary {
     }
 }
 
-fn main() {
-    let cli = Cli::parse();
+async fn call_openai_responses(input: &str) -> anyhow::Result<String> {
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| anyhow::anyhow!("OPENAI_API_KEYが環境変数に設定されていません"))?;
 
+    let client = reqwest::Client::new();
+
+    let body = serde_json::json!({
+        "model" : "gpt-5.2",
+        "input": input,
+        "max_output_tokens": 500
+    });
+
+    let resp = client
+        .post("https://api.openai.com/v1/responses")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await?;
+
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "OpenAI API error: status={}, body={}",
+            status,
+            v
+        ));
+    }
+
+    // 返答の取り出し: output_text があればそれを優先
+    if let Some(s) = v.get("output_text").and_then(|x| x.as_str()) {
+        return Ok(s.to_string());
+    }
+
+    // fallback: output配列から拾う
+    if let Some(arr) = v.get("output").and_then(|x| x.as_array()) {
+        // mesasge -> content[] -> output_text の "text" を連結する雑な実装
+        let mut out = String::new();
+        for item in arr {
+            if item.get("type").and_then(|t| t.as_str()) == Some("message") {
+                if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+                    for c in content {
+                        if c.get("type").and_then(|t| t.as_str()) == Some("output") {
+                            if let Some(text) = c.get("text").and_then(|t| t.as_str()) {
+                                out.push_str(text);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+    }
+
+    Err(anyhow::anyhow!("モデル出力の抽出に失敗しました: {}", v))
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
     let path = cli.path;
 
-    println!("path   : {:?}", path);
-    println!("detail : {:?}", cli.detail);
-    println!("focus  : {:?}", cli.focus);
-    println!();
-
-    let files = match collect_dir(&path) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("ディレクトリの読み込みに失敗しました: {}", e);
-            std::process::exit(1);
-        }
-    };
-
+    let files = collect_dir(&path)?;
     let summary = build_summary(&path, &files);
 
-    // detail があるなら pretty, なければ1行
-    if cli.detail {
-        println!("{}", serde_json::to_string_pretty(&summary).unwrap());
+    // AIに渡す文字列
+    let summary_json = if cli.detail {
+        serde_json::to_string_pretty(&summary)?
     } else {
-        println!("{}", serde_json::to_string(&summary).unwrap());
-    }
+        serde_json::to_string(&summary)?
+    };
+
+    let focus = format!("{:?}", cli.focus);
+
+    let prompt = format!(
+        r#"あなたは熟練のソフトウェアエンジニアです。
+以下のディレクトリ要約(JSON)から、このディレクトリが「何のプロジェクトか」を推定し、
+良い点・気になる点（特にセキュリティ／構成）・次のアクションを日本語で短くまとめてください。
+
+# focus: {focus}
+
+# summary(JSON)
+{summary_json}
+"#
+    );
+
+    let answer = call_openai_responses(&prompt).await?;
+    println!("{answer}");
+
+    Ok(())
 }
