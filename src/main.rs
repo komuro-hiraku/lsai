@@ -2,13 +2,9 @@ use anyhow::Ok;
 use clap::{Parser, ValueEnum};
 use reqwest::header;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
-    fmt::format,
-    fs, io,
-    os::linux::raw::stat,
-    path::{Path, PathBuf},
-    time::SystemTime,
+    collections::BTreeMap, fmt::format, fs, io, os::linux::raw::stat, path::{Path, PathBuf}, ptr::hash, time::SystemTime
 };
 
 #[derive(Debug, Serialize)]
@@ -65,6 +61,9 @@ struct Cli {
     /// 実行モード
     #[arg(short = 'x', long)]
     execute: bool,
+
+    #[arg(long)]
+    no_cache: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -300,6 +299,32 @@ async fn call_openai_responses(input: &str) -> anyhow::Result<String> {
     Err(anyhow::anyhow!("モデル出力の抽出に失敗しました: {}", v))
 }
 
+fn cache_key(s: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// cacheディレクトリ
+fn cache_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(".lsai_cache")
+}
+
+fn cache_path(key: &str) -> std::path::PathBuf {
+    let mut p = cache_dir();
+    p.push(format!("{key}.txt"));
+    p
+}
+
+fn read_cache(key: &str) -> Option<String> {
+    std::fs::read_to_string(cache_path(key)).ok()
+}
+
+fn write_cache(key: &str, text: &str) {
+    let _ = std::fs::create_dir_all(cache_dir());
+    let _ = std::fs::write(cache_path(key), text);
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -329,15 +354,30 @@ async fn main() -> anyhow::Result<()> {
 "#
     );
 
-    if !cli.execute {
-        println!("# dry-run (Not Call OpenAI API)");
-        println!("# -x / --execute を付与すると実行されます\n");
-        println!("{prompt}");
+    let key = cache_key(&prompt);
+
+    if cli.execute {
+        if !cli.no_cache {
+            if let Some(cached) = read_cache(&key) {
+                println!("# cached");
+                println!("{cached}");
+                return Ok(());
+            }
+        }
+        let answer = call_openai_responses(&prompt).await?;
+        
+        if !cli.no_cache {
+            write_cache(&key, &answer);
+        }
+        
+        println!("{answer}");
         return Ok(());
     }
 
-    let answer = call_openai_responses(&prompt).await?;
-    println!("{answer}");
-
+    // dry-run デフォルト
+    println!("# dry-run (Not Call OpenAI API)");
+    println!("# -x / --execute を付与すると実行されます\n");
+    println!("{prompt}");
     Ok(())
+    
 }
