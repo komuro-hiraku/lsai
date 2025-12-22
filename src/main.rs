@@ -61,6 +61,10 @@ struct Cli {
 
     #[arg(long, value_enum, default_value_t = Focus::Normal)]
     focus: Focus,
+
+    /// 実行モード
+    #[arg(short = 'x', long)]
+    execute: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -324,6 +328,13 @@ async fn main() -> anyhow::Result<()> {
 {summary_json}
 "#
     );
+
+    if !cli.execute {
+        println!("# dry-run (Not Call OpenAI API)");
+        println!("# -x / --execute を付与すると実行されます\n");
+        println!("{prompt}");
+        return Ok(());
+    }
 
     let answer = call_openai_responses(&prompt).await?;
     println!("{answer}");
